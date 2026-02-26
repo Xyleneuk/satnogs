@@ -11,6 +11,8 @@ services:
   satnogs_client:
     image: knegge/satnogs-client:lsf-addons
     user: "999"
+    group_add:
+      - "46"   # plugdev on your host
     read_only: false
     init: true
     env_file:
@@ -23,9 +25,10 @@ services:
       - "c 189:* rwm"
     devices:
       - /dev/bus/usb:/dev/bus/usb
+    tmpfs:
+      - /tmp
+      - /dev/shm
     volumes:
-      - type: tmpfs
-        target: /tmp
       - satnogs_client_data:/var/lib/satnogs-client
       - ./meteor.sh:/opt/bin/meteor.sh:ro
     restart: unless-stopped
