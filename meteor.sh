@@ -1,48 +1,111 @@
 #!/bin/bash
-# exit if pipeline fails or unset variables
-set -eu
+# Meteor LRPT demod+decode helper for SatNOGS
+# Expected args: {start|stop} {ID} {FREQ} {TLE_JSON} {TIMESTAMP} {BAUD} {SCRIPT_NAME}
 
-# Launch with: {command} {{ID}} {{FREQ}} {{TLE}} {{TIMESTAMP}} {{BAUD}} {{SCRIPT_NAME}}
-CMD="$1"     # $1 [start|stop]
-ID="$2"      # $2 observation ID
-#FREQ="$3"    # $3 frequency
-TLE="$4"     # $4 used tle's
-DATE="$5"    # $5 timestamp Y-m-dTH-M-S
-BAUD="$6"    # $6 baudrate
-SCRIPT="$7"  # $7 script name, satnogs_bpsk.py
+set -euo pipefail
 
-# default values
-: "${METEOR_NORAD:=57166 59051}"
-: "${UDP_DUMP_PORT:=57356}"
-: "${SATNOGS_APP_PATH:=/tmp/.satnogs}"
-: "${SATNOGS_OUTPUT_PATH:=/tmp/.satnogs/data}"
+CMD="${1:-}"
+ID="${2:-}"
+FREQ="${3:-}"          # may be unused, but keep positional compatibility
+TLE="${4:-}"
+DATE="${5:-}"
+BAUD="${6:-}"
+SCRIPT="${7:-}"
 
 PRG="Meteor demod+decode"
-METEOR_PID="$SATNOGS_APP_PATH/meteor_$SATNOGS_STATION_ID.pid"
+
+# Defaults (allow override via env)
+: "${METEOR_NORAD:=57166 59051}"
+: "${SATNOGS_APP_PATH:=/tmp/.satnogs}"
+: "${SATNOGS_OUTPUT_PATH:=/tmp/.satnogs/data}"
+: "${SATNOGS_STATION_ID:=0}"
+
+# Tools we rely on
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "$PRG: missing required command: $1" >&2; exit 1; }; }
+
+need_cmd awk
+need_cmd sed
+need_cmd jq
+need_cmd meteor_demod
+need_cmd meteor_decode
+
+METEOR_PID="$SATNOGS_APP_PATH/meteor_${SATNOGS_STATION_ID}.pid"
 IMAGE="$SATNOGS_OUTPUT_PATH/data_${ID}_${DATE}.png"
-SATNAME=$(echo "$TLE" | jq .tle0 | sed -e 's/ /_/g' | sed -e 's/[^A-Za-z0-9._-]//g')
-NORAD=$(echo "$TLE" | jq .tle2 | awk '{print $2}')
 
-if [ "${CMD^^}" == "START" ]; then
-  if [ -z ${METEOR_NORAD+x} ] || [[ " ${METEOR_NORAD} " =~ .*\ ${NORAD}\ .* ]]; then
-    echo "$PRG: $ID, Norad: $NORAD, Name: $SATNAME, Script: $SCRIPT"
-    if [ -z "$UDP_DUMP_HOST" ]; then
-      echo "Warning: UDP_DUMP_HOST not set, no data will be sent to the demod"
-    fi
-    SAMP=$(find_samp_rate.py "$BAUD" "$SCRIPT")
-    if [ -z "$SAMP" ]; then
-      SAMP=144000
-      echo "WARNING: find_samp_rate.py did not return valid sample rate!"
-    fi
-    SYMRATE=72000
-    INTERLACE=""
+# Extract sat name and NORAD from SatNOGS-provided TLE JSON
+# (jq -r to avoid quotes)
+SATNAME="$(echo "$TLE" | jq -r '.tle0 // "UNKNOWN"' | sed -e 's/ /_/g' -e 's/[^A-Za-z0-9._-]//g')"
+NORAD="$(echo "$TLE" | jq -r '.tle2 // ""' | awk '{print $2}' | tr -cd '0-9')"
 
+is_meteor_target() {
+  # If METEOR_NORAD is unset => treat as enabled for all
+  # If set => only run when NORAD is in list
+  if [ -z "${METEOR_NORAD+x}" ]; then
+    return 0
   fi
-fi
+  case " ${METEOR_NORAD} " in
+    *" ${NORAD} "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-if [ "${CMD^^}" == "STOP" ]; then
+log_header() {
+  echo "$PRG: Observation: $ID, Norad: ${NORAD:-UNKNOWN}, Name: $SATNAME, Script: $SCRIPT, Baud: $BAUD, Freq: $FREQ MHz"
+}
 
-meteor_demod --batch --quiet -O 8 -f 128 -s 160000 -r 7200 -m oqpsk --bps 16 /tmp/iq - | \
-meteor_decode --diff -a 65,65,64 -o "$image" -
+# Determine IQ path.
+# Prefer SATNOGS_IQ_FILE if your SatNOGS setup exports it.
+# Fallback to the common output naming pattern.
+IQ_FILE="${SATNOGS_IQ_FILE:-$SATNOGS_OUTPUT_PATH/iq_${ID}_${DATE}.raw}"
 
-fi
+case "${CMD^^}" in
+  START)
+    # START is typically just logging/marker; actual decode happens on STOP once IQ exists.
+    if is_meteor_target; then
+      log_header
+      echo "$PRG: START received. Will decode on STOP if IQ exists at: $IQ_FILE"
+      # Optional marker file so you can confirm hooks ran
+      mkdir -p "$SATNOGS_APP_PATH" "$SATNOGS_OUTPUT_PATH"
+      echo "$ID" > "$METEOR_PID"
+ else
+      echo "$PRG: START received but NORAD ${NORAD:-UNKNOWN} not in METEOR_NORAD list; skipping."
+    fi
+    ;;
+
+  STOP)
+    if ! is_meteor_target; then
+      echo "$PRG: STOP received but NORAD ${NORAD:-UNKNOWN} not in METEOR_NORAD list; skipping."
+      exit 0
+    fi
+
+    log_header
+
+    if [ ! -s "$IQ_FILE" ]; then
+      echo "$PRG: ERROR: IQ file not found or empty: $IQ_FILE" >&2
+      echo "$PRG: Hint: ensure IQ dumping is enabled and SATNOGS_IQ_FILE (or naming) matches your pipeline." >&2
+      exit 2
+    fi
+
+    mkdir -p "$(dirname "$IMAGE")"
+
+    # Your known-good settings (note -r 72000)
+    # meteor_demod writes frames to stdout; meteor_decode reads from stdin
+    echo "$PRG: Decoding IQ -> $IMAGE"
+    meteor_demod --batch --quiet -O 8 -f 128 -s 160000 -r 72000 -m oqpsk --bps 16 "$IQ_FILE" - \
+      | meteor_decode --diff -a 65,65,64 -o "$IMAGE" -
+
+    if [ -s "$IMAGE" ]; then
+      echo "$PRG: OK: wrote $IMAGE"
+    else
+      echo "$PRG: ERROR: decode completed but image missing/empty: $IMAGE" >&2
+      exit 3
+    fi
+
+    rm -f "$METEOR_PID" || true
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop} {ID} {FREQ} {TLE_JSON} {TIMESTAMP} {BAUD} {SCRIPT_NAME}" >&2
+    exit 1
+    ;;
+esac
