@@ -56,7 +56,7 @@ log_header() {
 # Determine IQ path.
 # Prefer SATNOGS_IQ_FILE if your SatNOGS setup exports it.
 # Fallback to the common output naming pattern.
-IQ_FILE="${SATNOGS_IQ_FILE:-$SATNOGS_OUTPUT_PATH/iq_${ID}_${DATE}.raw}"
+IQ_FILE="${SATNOGS_IQ_FILE:-/tmp/iq.raw}"
 
 case "${CMD^^}" in
   START)
