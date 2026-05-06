@@ -34,7 +34,7 @@ services:
 
     volumes:
       - satnogs_client_data:/var/lib/satnogs-client
-      - ./meteor.sh:/opt/bin/meteor.sh:ro
+      - ./meteor.sh:/opt/scripts/meteor.sh:ro
 
     restart: unless-stopped
     stop_grace_period: 1s
