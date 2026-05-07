@@ -1,15 +1,11 @@
 #!/bin/bash
-# Auto-decode new Meteor LRPT .s files using satdump
-# Run as a cron job (every 30 min): */30 * * * * /path/to/satdump_decode_lrpt.sh
-# Produces full-colour PNG images in DECODED_DIR for local archiving/review.
-# Note: SatNOGS network uploads are handled separately by meteor.sh (via meteor_decode).
+# Backup decode script: decodes any .s files not already handled by satdump_trigger.sh.
+# Run every 30 min: */30 * * * * /home/<user>/satdump_decode_lrpt.sh
 #
-# Crontab entries needed:
-#   */30 * * * * /home/james/satdump_decode_lrpt.sh
-#   # Clean LRPT soft-symbol files older than 4 days (owned by Docker user)
-#   0 3 * * * docker exec station-351_satnogs_client_1 bash -c "find /var/lib/satnogs-client -maxdepth 1 -name 'LRPT_*.s' -mtime +4 -delete" 2>/dev/null
-#   # Clean decoded image directories older than 7 days
-#   30 3 * * * find /mnt/satnogs/decoded -maxdepth 1 -mindepth 1 -type d -mtime +7 -exec rm -rf {} +
+# satdump_trigger.sh (run every 2 min) is the primary path — it decodes and uploads
+# immediately after each pass. This script is a fallback for any files satdump_trigger.sh
+# missed (e.g., system was offline when the pass ended). Files decoded here are NOT
+# automatically uploaded; they stay in DECODED_DIR for local review.
 
 LRPT_DIR=/mnt/satnogs
 DECODED_DIR=/mnt/satnogs/decoded

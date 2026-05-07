@@ -1,16 +1,18 @@
 #!/bin/bash
-# Meteor LRPT decode helper for SatNOGS (lsf-addons container)
-# The knegge/lsf-addons container demodulates LRPT and saves soft symbol
-# files (LRPT_*.s) to /var/lib/satnogs-client/. This script decodes those
-# .s files into images, saves them to SATNOGS_OUTPUT_PATH so the SatNOGS
-# client uploads them to network.satnogs.org, and archives a copy to USB.
+# Post-observation script for Meteor LRPT (lsf-addons container)
+#
+# On STOP: finds the .s soft-symbol file written during this pass and queues it
+# for satdump decoding + SatNOGS network upload on the host by writing a trigger
+# file to /var/lib/satnogs-client/pending/ (= /mnt/satnogs/pending/ on host).
+# The host-side satdump_trigger.sh cron (every 2 min) processes the trigger.
 #
 # Args: {start|stop} {ID} {FREQ} {TLE_JSON} {TIMESTAMP} {BAUD} {SCRIPT_NAME}
 #
-# Key fixes vs IQ-based approach:
-#   - Decodes directly from .s soft-symbol files (no meteor_demod needed)
-#   - Meteor M2-4 (NORAD 59051) requires -i flag (80k interleaved mode)
-#   - Image saved as data_${ID}_*.png so SatNOGS client uploads it to network
+# Why this approach instead of running meteor_decode inside the container:
+#   - knegge/satnogs-client:lsf-addons writes LSF-format .s files, which are
+#     incompatible with the meteor_decode tool (Viterbi avg ~1400, 0 MPDUs).
+#   - satdump (host-installed) correctly decodes LSF files via meteor_m2-x_lrpt.
+#   - The decoded PNG is uploaded directly to network.satnogs.org via API.
 
 set -euo pipefail
 
@@ -22,33 +24,21 @@ DATE="${5:-}"
 BAUD="${6:-}"
 SCRIPT="${7:-}"
 
-PRG="Meteor demod+decode"
+PRG="meteor-lrpt"
 
 : "${METEOR_NORAD:=57166 59051}"
-: "${SATNOGS_OUTPUT_PATH:=/tmp/.satnogs/data}"
 : "${SATNOGS_APP_PATH:=/var/lib/satnogs-client/meteor}"
-: "${SATNOGS_STATION_ID:=0}"
+PENDING_DIR="/var/lib/satnogs-client/pending"
 
-# Log to persistent storage
-ARCHIVE_DIR="${SATNOGS_APP_PATH}"
-mkdir -p "$ARCHIVE_DIR"
-exec > >(tee -a "$ARCHIVE_DIR/meteor_${ID:-noobs}.log") 2>&1
+mkdir -p "$SATNOGS_APP_PATH" "$PENDING_DIR"
+exec > >(tee -a "$SATNOGS_APP_PATH/meteor_${ID:-noobs}.log") 2>&1
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "$PRG: missing command: $1" >&2; exit 1; }; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "$PRG: missing: $1" >&2; exit 1; }; }
 need_cmd jq
 need_cmd awk
-need_cmd meteor_decode
 
-METEOR_PID="$SATNOGS_APP_PATH/meteor_${SATNOGS_STATION_ID}.pid"
-
-# Must be named data_* in SATNOGS_OUTPUT_PATH for SatNOGS client to upload it
-IMAGE="${SATNOGS_OUTPUT_PATH}/data_${ID}_${DATE}.png"
-
-# Persistent archive copy on USB
-ARCHIVE_IMAGE="${ARCHIVE_DIR}/meteor_${ID}_${DATE}_raw.png"
-
-SATNAME="$(echo "$TLE" | jq -r '.tle0 // "UNKNOWN"' | sed -e 's/ /_/g' -e 's/[^A-Za-z0-9._-]//g')"
 NORAD="$(echo "$TLE" | jq -r '.tle2 // ""' | awk '{print $2}' | tr -cd '0-9')"
+SATNAME="$(echo "$TLE" | jq -r '.tle0 // "UNKNOWN"' | sed -e 's/ /_/g' -e 's/[^A-Za-z0-9._-]//g')"
 
 is_meteor_target() {
   case " ${METEOR_NORAD} " in
@@ -57,71 +47,40 @@ is_meteor_target() {
   esac
 }
 
-log_header() {
-  echo "$PRG: Obs=$ID NORAD=${NORAD:-?} Name=$SATNAME Script=$SCRIPT Baud=$BAUD Freq=$FREQ"
-}
+echo "$PRG: CMD=$CMD Obs=$ID NORAD=${NORAD:-?} Name=$SATNAME"
 
 case "${CMD^^}" in
   START)
     if is_meteor_target; then
-      log_header
-      mkdir -p "$SATNOGS_APP_PATH" "$SATNOGS_OUTPUT_PATH"
-      echo "$ID" > "$METEOR_PID"
-      echo "$PRG: START - waiting for lsf-addons to capture .s file"
+      echo "$PRG: START - lsf-addons capturing .s file"
     else
-      echo "$PRG: START received but NORAD ${NORAD:-?} not in METEOR_NORAD list; skipping."
+      echo "$PRG: NORAD ${NORAD:-?} not in target list; skipping"
     fi
     ;;
 
   STOP)
     if ! is_meteor_target; then
-      echo "$PRG: STOP received but NORAD ${NORAD:-?} not in METEOR_NORAD list; skipping."
+      echo "$PRG: NORAD ${NORAD:-?} not in target list; skipping"
       exit 0
     fi
 
-    log_header
-
-    # Find the .s soft-symbol file created by lsf-addons during this pass.
-    # Look for a large (>5MB) .s file modified within the last 60 minutes.
+    # Find the .s soft-symbol file from this pass (>5 MB, written in last 60 min)
     SFILE=$(find /var/lib/satnogs-client -maxdepth 1 -name "LRPT_*.s" \
-              -size +5M -mmin -60 2>/dev/null \
-            | sort | tail -1)
+              -size +5M -mmin -60 2>/dev/null | sort | tail -1)
 
     if [ -z "$SFILE" ]; then
-      echo "$PRG: No recent large LRPT .s file found (weak/no signal this pass)." >&2
-      exit 2
+      echo "$PRG: No recent LRPT .s file found (weak/no signal this pass)"
+      exit 0
     fi
 
     SSIZE=$(stat -c%s "$SFILE")
-    echo "$PRG: Using .s file: $SFILE (${SSIZE} bytes)"
+    SBASE=$(basename "$SFILE" .s)
+    echo "$PRG: Pass captured: $SBASE (${SSIZE} bytes)"
 
-    mkdir -p "$SATNOGS_OUTPUT_PATH" "$ARCHIVE_DIR"
-
-    # Decode flags:
-    # -d  = differential decoding (all Meteor-M2)
-    # -i  = deinterleave, aka 80k mode (Meteor M2-4 only, NORAD 59051)
-    # -a  = APID channels for MSU-MR visible RGB
-    DECODE_FLAGS="-d -a 65,65,64"
-    if [ "${NORAD}" = "59051" ]; then
-      DECODE_FLAGS="-d -i -a 65,65,64"
-      echo "$PRG: Using 80k deinterleave mode for Meteor M2-4"
-    fi
-
-    echo "$PRG: Decoding -> $IMAGE"
-    # shellcheck disable=SC2086
-    meteor_decode $DECODE_FLAGS -o "$IMAGE" "$SFILE"
-
-    if [ -s "$IMAGE" ]; then
-      IMGSIZE=$(stat -c%s "$IMAGE")
-      echo "$PRG: OK: image saved ($IMGSIZE bytes) -> $IMAGE"
-      cp "$IMAGE" "$ARCHIVE_IMAGE" && echo "$PRG: Archived -> $ARCHIVE_IMAGE"
-    else
-      echo "$PRG: WARN: meteor_decode ran but image empty (poor signal?)" >&2
-      rm -f "$IMAGE"
-      exit 3
-    fi
-
-    rm -f "$METEOR_PID" 2>/dev/null || true
+    # Write trigger file - host satdump_trigger.sh reads from /mnt/satnogs/pending/
+    TRIGGER="${PENDING_DIR}/${SBASE}.pending"
+    echo "$ID" > "$TRIGGER"
+    echo "$PRG: Queued obs $ID for satdump decode + upload -> $TRIGGER"
     ;;
 
   *)
