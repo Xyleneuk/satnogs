@@ -56,14 +56,40 @@ case "${CMD^^}" in
 
   STOP)
     if is_meteor; then
-      SFILE=$(find /var/lib/satnogs-client -maxdepth 1 -name "LRPT_*.s" \
-                -size +5M -mmin -60 2>/dev/null | sort | tail -1)
-      if [ -z "$SFILE" ]; then
-        echo "$PRG: No LRPT .s file found (weak/no signal)"
-        exit 0
+      # Demodulate IQ dump → LRPT_DATE.s (the only mechanism that creates .s files)
+      IQ_FILE="${IQ_DUMP_FILENAME:-/var/lib/satnogs-client/iq/iq.raw}"
+      IQ_SIZE=$(stat -c%s "$IQ_FILE" 2>/dev/null || echo 0)
+      if [ "$IQ_SIZE" -gt 52428800 ]; then
+        _ts="${DATE:-$(date -u '+%Y-%m-%dT%H-%M-%S')}"
+        DATE_FMT=$(echo "$_ts" | sed 's/-/_/g; s/T/-/; s/_[0-9]*$//')
+        SFILE="/var/lib/satnogs-client/LRPT_${DATE_FMT}.s"
+        echo "$PRG: Demodulating IQ ($IQ_SIZE bytes) → $SFILE"
+        if meteor_demod -B -q -O 8 -f 128 -s 160000 -r 72000 -m oqpsk --bps 16 \
+            -o "$SFILE" "$IQ_FILE" 2>&1; then
+          echo "$PRG: meteor_demod done ($(stat -c%s "$SFILE" 2>/dev/null || echo 0) bytes)"
+        else
+          echo "$PRG: meteor_demod failed (exit $?)"
+          rm -f "$SFILE"
+          SFILE=""
+        fi
+      else
+        echo "$PRG: IQ dump missing or too small ($IQ_SIZE bytes) — weak/no signal"
+        SFILE=""
+      fi
+      # Fall back to any pre-existing .s (e.g. written by a pre-script)
+      if [ -z "${SFILE:-}" ]; then
+        SFILE=$(find /var/lib/satnogs-client -maxdepth 1 -name "LRPT_*.s" \
+                  -size +5M -mmin -60 2>/dev/null | sort | tail -1)
+      fi
+      if [ -z "${SFILE:-}" ] || [ ! -f "$SFILE" ]; then
+        echo "$PRG: No usable .s file — skipping"; exit 0
+      fi
+      FSIZE=$(stat -c%s "$SFILE")
+      if [ "$FSIZE" -lt 5242880 ]; then
+        echo "$PRG: .s too small ($FSIZE bytes) — skipping"; exit 0
       fi
       SBASE=$(basename "$SFILE" .s)
-      echo "$PRG: Queuing $SBASE ($(stat -c%s "$SFILE") bytes) for satdump"
+      echo "$PRG: Queuing $SBASE ($FSIZE bytes) for satdump"
       echo "$ID" > "${PENDING_DIR}/${SBASE}.pending"
 
     elif is_iss; then
