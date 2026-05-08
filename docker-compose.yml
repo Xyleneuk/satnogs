@@ -1,3 +1,5 @@
+name: satnogs
+
 services:
   rigctld:
     image: librespace/hamlib:4.0
@@ -12,32 +14,22 @@ services:
     image: knegge/satnogs-client:lsf-addons
     user: "999"
     group_add:
-      - "46"   # plugdev on your host (optional once privileged)
-    read_only: false
-    init: true
-
+      - "46"
     privileged: true
-
+    init: true
     env_file:
       - ./station.env
     environment:
       SATNOGS_RIG_IP: rigctld
       SATNOGS_RIG_PORT: "4532"
     command: satnogs-client
-
     devices:
       - /dev/bus/usb:/dev/bus/usb
-
     tmpfs:
       - /tmp
       - /dev/shm
-
     volumes:
-      - satnogs_client_data:/var/lib/satnogs-client
+      - /mnt/satnogs:/var/lib/satnogs-client
       - ./meteor.sh:/opt/scripts/meteor.sh:ro
-
     restart: unless-stopped
     stop_grace_period: 1s
-
-volumes:
-  satnogs_client_data:
